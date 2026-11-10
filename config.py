@@ -296,7 +296,34 @@ try:
     from pyrogram.storage import FileStorage as _SessionStorage   # Original Pyrogram
 except ImportError:
     from pyrogram.storage import SQLiteStorage as _SessionStorage  # Kurigram fork
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup  # Button menus
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message as _PyroMessage,
+)
+
+# Some Pyrogram/Kurigram short-message updates include sender details in the
+# Message object without persisting that peer to SQLite. Cache the raw sender/chat
+# before reply_text resolves the numeric chat ID.
+_original_message_reply = _PyroMessage.reply
+
+
+async def _reply_with_cached_peers(self, *args, **kwargs):
+    peers = []
+    for peer in (getattr(self, "from_user", None), getattr(self, "chat", None)):
+        raw_peer = getattr(peer, "raw", None)
+        if raw_peer is not None:
+            peers.append(raw_peer)
+
+    fetch_peers = getattr(getattr(self, "_client", None), "fetch_peers", None)
+    if peers and fetch_peers:
+        await fetch_peers(peers)
+    return await _original_message_reply(self, *args, **kwargs)
+
+
+_PyroMessage.reply = _reply_with_cached_peers
+_PyroMessage.reply_text = _reply_with_cached_peers
 
 _BUTTON_STYLE = getattr(enums, "ButtonStyle", None)
 _PRIMARY = getattr(_BUTTON_STYLE, "PRIMARY", None)
@@ -372,7 +399,8 @@ async def _safe_callback_answer(self, *args, **kwargs):
         logging.debug(f"Ignored error in CallbackQuery.answer: {e}")
 CallbackQuery.answer = _safe_callback_answer
 
-# Monkey-patch SQLiteStorage.update_peers to safely ignore 'closed database' errors during teardown
+# Retry transient SQLite locks while storing peers; ignore only teardown-time
+# closed-database errors so legitimate peer updates are not silently discarded.
 import pyrogram.storage.sqlite_storage as _pyro_sqlite_mod
 SQLiteStorage = _pyro_sqlite_mod.SQLiteStorage
 USERNAMES_SCHEMA = getattr(_pyro_sqlite_mod, "USERNAMES_SCHEMA", "")
@@ -388,21 +416,24 @@ def _get_pyro_conn(storage):
 
 _original_update_peers = SQLiteStorage.update_peers
 async def _safe_update_peers(self, peers):
+    # Make the input repeatable in case a transient SQLite lock requires retrying.
+    peers = tuple(peers)
     for _retry in range(3):
         try:
-            conn = _get_pyro_conn(self)
-            if conn:
-                await _original_update_peers(self, peers)
+            await _original_update_peers(self, peers)
             return
-        except sqlite3.OperationalError as e:
-            if ("locked" in str(e).lower() or "busy" in str(e).lower()) and _retry < 2:
-                await asyncio.sleep(0.05 * (_retry + 1))
+        except sqlite3.OperationalError as exc:
+            error_text = str(exc).lower()
+            if ("locked" in error_text or "busy" in error_text) and _retry < 2:
+                await asyncio.sleep(0.1 * (_retry + 1))
                 continue
-            return
-        except sqlite3.ProgrammingError:
-            return
-        except Exception:
-            return
+            if "closed" in error_text:
+                return
+            raise
+        except sqlite3.ProgrammingError as exc:
+            if "closed" in str(exc).lower():
+                return
+            raise
 SQLiteStorage.update_peers = _safe_update_peers
 
 # Monkey-patch SQLiteStorage.update to safely handle schema migrations without crashing on pre-existing columns/tables
