@@ -30,6 +30,7 @@ import os
 import random
 import re
 import shutil
+import socket
 import sqlite3
 import string
 import struct
@@ -140,6 +141,38 @@ FLOODWAIT_PROXY_PASS = (os.getenv("FLOODWAIT_PROXY_PASS") or "").strip() or None
 
 # Set USE_IPV6=true only when the host has working public IPv6 connectivity.
 USE_IPV6 = os.environ.get("USE_IPV6", "False").lower() in ("true", "1", "t")
+
+# main.py starts its health-check server on 8080 by default. Respect a port
+# explicitly supplied by the host/user; for local runs, choose a free port if
+# the default is already occupied (for example, by another Termux process).
+def _configure_local_health_port():
+    port = (os.environ.get("PORT") or "").strip()
+    server_port = (os.environ.get("SERVER_PORT") or "").strip()
+    if port:
+        return
+    if server_port:
+        # main.py prioritizes PORT, so normalize SERVER_PORT into PORT as well.
+        os.environ["PORT"] = server_port
+        return
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("0.0.0.0", 8080))
+        return  # The default is available; main.py will use 8080.
+    except OSError:
+        pass
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("0.0.0.0", 0))
+            available_port = probe.getsockname()[1]
+    except OSError:
+        return  # Leave main.py's default in place so it can report the bind error.
+
+    os.environ["PORT"] = str(available_port)
+
+
+_configure_local_health_port()
 
 # Local storage paths (normally left at their defaults).
 ROOT_DIR = "accstore_data"
