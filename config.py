@@ -265,15 +265,23 @@ except ImportError:
     from pyrogram.storage import SQLiteStorage as _SessionStorage  # Kurigram fork
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup  # Button menus
 
-_PRIMARY = enums.ButtonStyle.PRIMARY
-_DANGER = enums.ButtonStyle.DANGER
+_BUTTON_STYLE = getattr(enums, "ButtonStyle", None)
+_PRIMARY = getattr(_BUTTON_STYLE, "PRIMARY", None)
+_DANGER = getattr(_BUTTON_STYLE, "DANGER", None)
 
 
 def styled_button(text, *args, **kwargs):
-    """Build consistent, touch-friendly inline buttons with semantic danger styling."""
+    """Build an inline button, applying semantic styling when the library supports it."""
     label = str(text).casefold()
     danger_terms = ("logout", "log out", "clear", "delete", "cancel", "remove", "terminate", "revoke", "destroy", "abort", "stop", "ban", "reset")
-    kwargs.setdefault("style", _DANGER if any(term in label for term in danger_terms) else _PRIMARY)
+    style = _DANGER if any(term in label for term in danger_terms) else _PRIMARY
+
+    if style is None:
+        # Upstream Pyrogram versions do not expose ButtonStyle or accept a `style`
+        # argument. Keep the buttons usable there; Kurigram can still apply colors.
+        kwargs.pop("style", None)
+    else:
+        kwargs.setdefault("style", style)
     return InlineKeyboardButton(text, *args, **kwargs)
 
 

@@ -30,9 +30,16 @@ class TestAuditRegressions(unittest.TestCase):
             self.assertTrue(config.zip_belongs_to_user(41, 100))
 
     def test_button_semantic_styles(self):
-        self.assertEqual(config.styled_button("Open Pack", callback_data="open").style, config._PRIMARY)
-        for label in ("Logout", "Clear Cache", "Delete Pack", "Cancel", "Revoke Device"):
-            self.assertEqual(config.styled_button(label, callback_data="x").style, config._DANGER)
+        labels = ("Logout", "Clear Cache", "Delete Pack", "Cancel", "Revoke Device")
+        if config._PRIMARY is None or config._DANGER is None:
+            # Standard Pyrogram lacks the optional Kurigram button-style extension.
+            self.assertIsNotNone(config.styled_button("Open Pack", callback_data="open"))
+            for label in labels:
+                self.assertIsNotNone(config.styled_button(label, callback_data="x"))
+        else:
+            self.assertEqual(config.styled_button("Open Pack", callback_data="open").style, config._PRIMARY)
+            for label in labels:
+                self.assertEqual(config.styled_button(label, callback_data="x").style, config._DANGER)
 
 
     def test_sudo_duration_and_expiry(self):
