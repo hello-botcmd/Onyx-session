@@ -1,10 +1,10 @@
 # ==============================================================================
-# Onyx Session Manager — Configuration, Constants, State & Foundation
+# VLR Session Manager — Configuration, Constants, State & Foundation
 # ==============================================================================
 
 """
 ╔═══════════════════════════════════════════════════════════════╗
-║         Onyx — Session Management Platform         ║
+║              VLR — Session Management Platform               ║
 ╚═══════════════════════════════════════════════════════════════╝
 
   Upload .session packs and run powerful operations on them.
@@ -12,18 +12,39 @@
   Setup:
     1. Visit https://my.telegram.org → Get APP_ID + APP_HASH
     2. Open @BotFather → /newbot → Get BOT_TOKEN
-    3. Fill in the .env file with your credentials
+    3. Fill in the .env file with your credentials and optional settings
     4. pip install -r requirements.txt
     5. python main.py
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module Imports
-# External libraries used by the platform.
-# 
 # ─────────────────────────────────────────────────────────────────────────────
-
 import asyncio
+import base64
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import sqlite3
+import string
+import struct
+import sys
+import tempfile
+import threading
+import time
+import zipfile
+from collections import deque
+from datetime import datetime, timezone
+
+from dotenv import load_dotenv
+
+# Install uvloop when available and make sure an event loop exists before creating
+# module-level locks and semaphores.
 try:
     import uvloop
     uvloop.install()
@@ -35,17 +56,124 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
+# Load .env before reading any user-provided settings below.
+load_dotenv()
+
+
+def _clean_url(url):
+    """Normalize Telegram usernames and URLs supplied in configuration."""
+    if not url:
+        return ""
+    url = url.strip()
+    if url.startswith("@"):
+        return f"https://t.me/{url[1:]}"
+    if not (url.startswith("http://") or url.startswith("https://")):
+        if "/" not in url and "." not in url:
+            return f"https://t.me/{url}"
+        return f"https://{url}"
+    return url
+
+
+# ==============================================================================
+# USER CONFIGURATION — set these in .env or the process environment
+# ==============================================================================
+# Required Telegram credentials:
+#   API_ID=123456
+#   API_HASH=your_api_hash
+#   BOT_TOKEN=123456:your_bot_token
+API_ID_RAW = os.getenv("API_ID")
+if not API_ID_RAW:
+    raise ValueError("API_ID is missing from .env file")
+API_ID = int(API_ID_RAW)
+
+API_HASH = os.getenv("API_HASH")
+if not API_HASH:
+    raise ValueError("API_HASH is missing from .env file")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN is missing from .env file")
+
+# Bot display name and access controls. ADMIN_IDS is a comma-separated list.
+PLATFORM_NAME = os.getenv("PLATFORM_NAME", "VLR Session Manager")
+_raw_admins = (os.getenv("ADMIN_IDS") or "").strip()
+ADMIN_IDS = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
+
+# Links shown to users; leave blank to hide them.
+CHANNEL_LINK = _clean_url(os.getenv("CHANNEL_LINK"))
+SUPPORT_LINK = _clean_url(os.getenv("SUPPORT_LINK"))
+
+# Connection and safety limits.
+_raw_concurrency = int(os.getenv("MAX_CONCURRENCY", "2"))
+MAX_CONCURRENCY = max(1, min(_raw_concurrency, 2))
+SAFE_CONCURRENCY = max(1, min(MAX_CONCURRENCY, 2))
+CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "20"))
+SKIP_SPAMBOT = os.getenv("SKIP_SPAMBOT", "False").lower() == "true"
+GLOBAL_MAX_CONNECTIONS = max(25, int(os.getenv("GLOBAL_MAX_CONNECTIONS", "25")))
+GLOBAL_CONNECTION_SEM = asyncio.Semaphore(GLOBAL_MAX_CONNECTIONS)
+MAIL_BIND_SEMAPHORE = asyncio.Semaphore(2)
+
+# Optional general proxy for session operations; leave PROXY_HOST blank to disable.
+_PROXY_TYPE = (os.getenv("PROXY_TYPE") or "").strip().lower()
+_PROXY_HOST = (os.getenv("PROXY_HOST") or "").strip()
+_PROXY_PORT = (os.getenv("PROXY_PORT") or "").strip()
+_PROXY_USER = (os.getenv("PROXY_USER") or "").strip() or None
+_PROXY_PASS = (os.getenv("PROXY_PASS") or "").strip() or None
+
+# Optional device identity overrides. Safe mobile defaults are used when blank.
+DEVICE_MODEL = (os.getenv("DEVICE_MODEL") or "").strip()
+SYSTEM_VERSION = (os.getenv("SYSTEM_VERSION") or "").strip()
+_RAW_APP_NAME = (os.getenv("APP_NAME") or "").strip()
+_RAW_APP_VERSION = (os.getenv("APP_VERSION") or "").strip()
+APP_VERSION = f"{_RAW_APP_NAME} {_RAW_APP_VERSION}".strip()
+SAFE_DEVICE_MODEL = "Samsung Galaxy S23 Ultra"
+SAFE_SYSTEM_VERSION = "Android 13 (API 33)"
+SAFE_APP_VERSION = "10.14.5 (4589)"
+SAFE_LANG_CODE = "en"
+SAFE_SYSTEM_LANG_CODE = "en"
+
+# Dedicated proxy used only when Telegram raises a FloodWait.
+FLOODWAIT_PROXY_HOST = (os.getenv("FLOODWAIT_PROXY_HOST") or "").strip()
+FLOODWAIT_PROXY_PORT = int((os.getenv("FLOODWAIT_PROXY_PORT") or "443").strip())
+FLOODWAIT_PROXY_USER = (os.getenv("FLOODWAIT_PROXY_USER") or "").strip() or None
+FLOODWAIT_PROXY_PASS = (os.getenv("FLOODWAIT_PROXY_PASS") or "").strip() or None
+
+# Set USE_IPV6=true only when the host has working public IPv6 connectivity.
+USE_IPV6 = os.environ.get("USE_IPV6", "False").lower() in ("true", "1", "t")
+
+# Local storage paths (normally left at their defaults).
+ROOT_DIR = "accstore_data"
+BOT_LOG_PATH = os.path.join(ROOT_DIR, "bot.log")
+PACKS_DIR = os.path.join(ROOT_DIR, "packs")
+META_FILE = os.path.join(ROOT_DIR, "registry.json")
+
+# Configure stdout logging for server consoles (like KataBump)
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    level=logging.INFO
+)
+logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(logging.CRITICAL)
+
+try:
+    os.makedirs(ROOT_DIR, exist_ok=True)
+    # Avoid duplicate lines when running inside screen / daemon piped to tee
+    if sys.stdout and getattr(sys.stdout, "isatty", lambda: False)():
+        _bot_file_handler = logging.FileHandler(BOT_LOG_PATH, encoding="utf-8")
+        _bot_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
+        logging.getLogger().addHandler(_bot_file_handler)
+except Exception:
+    pass
+
+
 # ==============================================================================
 # SECTION 1: CONCURRENT BATCH RUNNER
 # ==============================================================================
-# This utility lets the bot process thousands of active session tasks concurrently
-# without blocking the event loop or causing the system to freeze.
+# Process large sets of tasks without overwhelming the event loop.
 async def gather_chunked(coro_gen, limit=30):
     pending = set()
     for coro in coro_gen:
         if len(pending) >= limit:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            # Surface exceptions from completed tasks so errors aren't silently lost
             for task in done:
                 if task.exception() is not None:
                     logging.warning(f"[gather_chunked] Worker task failed: {task.exception()}")
@@ -55,44 +183,6 @@ async def gather_chunked(coro_gen, limit=30):
         for task in done:
             if task.exception() is not None:
                 logging.warning(f"[gather_chunked] Worker task failed: {task.exception()}")
-import base64           # Encodes data into text (like a secret code writer)
-import hashlib          # Creates unique fingerprints for files (like a file ID card)
-import json             # Reads and writes data in a format computers understand
-import os               # Talks to your computer's file system (folders, files)
-import random
-import string
-import re               # Searches for patterns in text (like finding a phone number)
-import shutil           # Copies, moves, and deletes folders
-import sqlite3          # Reads small database files (where sessions are stored)
-import struct           # Packs data into binary format (computer-friendly)
-import tempfile         # Creates temporary folders that get cleaned up later
-import time             # Keeps track of time (for timeouts and delays)
-import zipfile          # Opens and creates ZIP files (compressed folders)
-from datetime import datetime, timezone  # Gets the current date and time
-from dotenv import load_dotenv  # Loads configuration from .env file
-import contextlib
-import logging
-import asyncio
-
-# Configure stdout logging for server consoles (like KataBump)
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    level=logging.INFO
-)
-logging.getLogger("pyrogram.connection.transport.tcp.tcp").setLevel(logging.CRITICAL)
-
-ROOT_DIR = "accstore_data"
-BOT_LOG_PATH = os.path.join(ROOT_DIR, "bot.log")
-try:
-    os.makedirs(ROOT_DIR, exist_ok=True)
-    import sys
-    # Avoid duplicate lines when running inside screen / daemon piped to tee
-    if sys.stdout and getattr(sys.stdout, "isatty", lambda: False)():
-        _bot_file_handler = logging.FileHandler(BOT_LOG_PATH, encoding="utf-8")
-        _bot_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-        logging.getLogger().addHandler(_bot_file_handler)
-except Exception:
-    pass
 
 
 class AdminNotifierHandler(logging.Handler):
@@ -134,9 +224,6 @@ class AdminNotifierHandler(logging.Handler):
 META_LOCK = asyncio.Lock()
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
 logging.getLogger("telethon").setLevel(logging.ERROR)
-
-# Load .env file (looks in current dir and parent dirs)
-load_dotenv()
 
 # --- Python 3.14 / Pyrogram Fix ---
 try:
@@ -483,89 +570,8 @@ tele_reasons = {
 }
 
 # ==============================================================================
-# SECTION 2: SYSTEM CREDENTIALS AND FALLBACK CONFIGURATION
+# SECTION 2: SESSION AND NETWORK HELPERS
 # ==============================================================================
-# Loaded from the local .env configuration file. Keeps credentials secure.
-# Falls back to default values if the .env file is missing.
-API_ID_RAW = os.getenv("API_ID")
-if not API_ID_RAW:
-    raise ValueError("API_ID is missing from .env file")
-API_ID = int(API_ID_RAW)
-
-API_HASH = os.getenv("API_HASH")
-if not API_HASH:
-    raise ValueError("API_HASH is missing from .env file")
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN is missing from .env file")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Platform Customization
-# ─────────────────────────────────────────────────────────────────────────────
-PLATFORM_NAME = os.getenv("PLATFORM_NAME", "Onyx Session Manager")
-# Ultra-Safe Anti-Freeze / Anti-Revoke concurrency policy:
-# Never hammer Telegram with high concurrent connections from a single IP.
-# Strictly satisfies: "if process slow then no worry but accounts must not freeze or revoke".
-_raw_concurrency = int(os.getenv("MAX_CONCURRENCY", "2"))
-MAX_CONCURRENCY = max(1, min(_raw_concurrency, 2))
-SAFE_CONCURRENCY = max(1, min(MAX_CONCURRENCY, 2))
-CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "20"))
-SKIP_SPAMBOT = os.getenv("SKIP_SPAMBOT", "False").lower() == "true"
-
-# Global connection limiter to prevent IP flagging across all 500+ users
-GLOBAL_MAX_CONNECTIONS = max(25, int(os.getenv("GLOBAL_MAX_CONNECTIONS", "25")))
-GLOBAL_CONNECTION_SEM = asyncio.Semaphore(GLOBAL_MAX_CONNECTIONS)
-# Bound concurrent email-binding flows across users to keep Telegram RPCs below flood thresholds.
-MAIL_BIND_SEMAPHORE = asyncio.Semaphore(2)
-
-# External links (displayed on the main /start menu if set)
-def _clean_url(url):
-    if not url:
-        return ""
-    url = url.strip()
-    if url.startswith("@"):
-        return f"https://t.me/{url[1:]}"
-    if not (url.startswith("http://") or url.startswith("https://")):
-        if "/" not in url and "." not in url:
-            return f"https://t.me/{url}"
-        return f"https://{url}"
-    return url
-
-CHANNEL_LINK = _clean_url(os.getenv("CHANNEL_LINK"))
-SUPPORT_LINK = _clean_url(os.getenv("SUPPORT_LINK"))
-
-# Access restriction: comma-separated user IDs. If empty, anyone can use the bot.
-_raw_admins = (os.getenv("ADMIN_IDS") or "").strip()
-ADMIN_IDS = [int(x.strip()) for x in _raw_admins.split(",") if x.strip().isdigit()]
-
-# ==============================================================================
-# SECTION 3: SYSTEM-WIDE PROXY TRANSLATOR
-# ==============================================================================
-# Supports Socks5, Socks4, and HTTP protocols. Used to make session operations
-# bypass local firewall limits and run under localized network regions.
-_PROXY_TYPE = (os.getenv("PROXY_TYPE") or "").strip().lower()
-_PROXY_HOST = (os.getenv("PROXY_HOST") or "").strip()
-_PROXY_PORT = (os.getenv("PROXY_PORT") or "").strip()
-_PROXY_USER = (os.getenv("PROXY_USER") or "").strip() or None
-_PROXY_PASS = (os.getenv("PROXY_PASS") or "").strip() or None
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Device Identity Configuration
-# ─────────────────────────────────────────────────────────────────────────────
-DEVICE_MODEL = (os.getenv("DEVICE_MODEL") or "").strip()
-SYSTEM_VERSION = (os.getenv("SYSTEM_VERSION") or "").strip()
-_RAW_APP_NAME = (os.getenv("APP_NAME") or "").strip()
-_RAW_APP_VERSION = (os.getenv("APP_VERSION") or "").strip()
-APP_VERSION = f"{_RAW_APP_NAME} {_RAW_APP_VERSION}".strip()
-
-
-
-SAFE_DEVICE_MODEL = "Samsung Galaxy S23 Ultra"
-SAFE_SYSTEM_VERSION = "Android 13 (API 33)"
-SAFE_APP_VERSION = "10.14.5 (4589)"
-SAFE_LANG_CODE = "en"
-SAFE_SYSTEM_LANG_CODE = "en"
 
 def _get_device_params_for_session(workdir, session_name):
     """Load authentic device params from .json if available, or realistic mobile defaults."""
@@ -662,11 +668,6 @@ except Exception:
 # FLOODWAIT DEDICATED FAILOVER PROXY
 # ─────────────────────────────────────────────────────────────────
 # Dedicated residential proxy used exclusively when FloodWait / IP rate-limit occurs.
-FLOODWAIT_PROXY_HOST = (os.getenv("FLOODWAIT_PROXY_HOST") or "").strip()
-FLOODWAIT_PROXY_PORT = int((os.getenv("FLOODWAIT_PROXY_PORT") or "443").strip())
-FLOODWAIT_PROXY_USER = (os.getenv("FLOODWAIT_PROXY_USER") or "").strip() or None
-FLOODWAIT_PROXY_PASS = (os.getenv("FLOODWAIT_PROXY_PASS") or "").strip() or None
-
 def get_floodwait_pyro_proxy(session_id=None, force_pool=False):
     """
     Get proxy configuration for Pyrogram to bypass FloodWait rate limit.
@@ -741,15 +742,8 @@ FLOODWAIT_PYRO_PROXY = get_floodwait_pyro_proxy()
 FLOODWAIT_TELE_PROXY = get_floodwait_tele_proxy()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Runtime Configuration
-# 
-# 
+# Static runtime defaults and Telegram metadata
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-ROOT_DIR = "accstore_data"
-PACKS_DIR = os.path.join(ROOT_DIR, "packs")       # Folder where uploaded zips live
-META_FILE = os.path.join(ROOT_DIR, "registry.json")  
 
 # This message appears when an account has been permanently banned by Telegram
 DEAD_MESSAGE = (
@@ -770,9 +764,6 @@ OTP_REGEX = re.compile(r"\b(\d{5})\b")
 # (important Telegram system accounts)
 KEEP_USERNAMES = {"spambot", "tgdnabot", "telegram"}
 KEEP_IDS = {777000, 42777, 34599577}  # 777000 = Telegram's own account
-
-# IPv6 toggle — set to True only if VPS has a public IPv6 address
-USE_IPV6 = os.environ.get("USE_IPV6", "False").lower() in ("true", "1", "t")
 
 # Telegram's data center addresses around the world
 # (like different offices of Telegram in different countries)
@@ -826,7 +817,6 @@ BUTTON_RATE_LIMIT = {}  # Prevents users from clicking buttons too fast
 PROGRESS_STATE = {}     # Tracks download/upload progress percentages
 BOT_START_TIME = time.time()  # Tracks when the bot was started
 
-from collections import deque
 ADMIN_ACTIVITY_LOG = deque(maxlen=50)  # Rolling log of admin actions
 WHITELIST_MODE = False  # If True, only whitelisted users can use the bot
 WHITELISTED_USERS = set()  # Persisted IDs allowed when whitelist mode is active
@@ -988,7 +978,6 @@ def ensure_storage():
 
 
 # Open the notebook and read all the data inside it.
-import threading
 _META_FILE_LOCK = threading.RLock()
 
 def load_meta():
